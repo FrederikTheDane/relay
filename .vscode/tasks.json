@@ -15,6 +15,11 @@
         {
             "label": "Run",
             "type": "shell",
+            "options": {
+                "env": {
+                    "RUST_BACKTRACE": "1"
+                    }
+            },
             "command": "cargo run",
             "problemMatcher": []
         }

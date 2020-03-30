@@ -1,4 +1,4 @@
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{TcpListener, TcpStream, SocketAddr, Shutdown};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::io::{Write, BufReader, BufRead};
@@ -46,9 +46,9 @@ fn main() {
 
     let dist_run = run.clone();
 
-    let connections_dist_copy = connections.clone();
+    let connections_dist_clone = connections.clone();
     thread::spawn(move || {
-        distribute(rcv, dist_run, connections_dist_copy);
+        distribute(rcv, dist_run, connections_dist_clone);
     });
 
     while listener.set_nonblocking(true).is_err() {}
@@ -61,14 +61,16 @@ fn main() {
             let send = snd.clone();
             let mut cloned_stream = stream.0.try_clone().unwrap();
             connections.lock().unwrap().insert(stream.1, stream.0);
+            let conn_handler_clone = connections.clone();
             thread::spawn(move || {
-                handle_connection(send, run_clone, &mut cloned_stream);
+                handle_connection(send, run_clone, &mut cloned_stream, conn_handler_clone);
             });        
         }
         thread::sleep(time::Duration::from_millis(1000));
     }
-    if !connections.lock().unwrap().is_empty() {
-        println!("Some connections are still open. Force shutdown in 5 seconds");
+    let conn = connections.lock().unwrap();
+    if !conn.is_empty() {
+        println!("{} connection(s) are still open. Force shutdown in 5 seconds", conn.len());
         thread::sleep(time::Duration::from_secs(5));
     }
     
@@ -77,38 +79,48 @@ fn main() {
 
 fn distribute(rec: mpsc::Receiver<Vec<u8>>, should_run: Arc<AtomicBool>, streams: Arc<Mutex<HashMap<SocketAddr, TcpStream>>>) {
     while should_run.load(Ordering::Acquire) {
-        let read_vec = rec.recv_timeout(time::Duration::from_millis(10));
-        if let Ok(vec) = read_vec {
-            println!("{}", std::str::from_utf8(&vec).unwrap());
-            match streams.lock() {
-                Ok(mut streams_map) => {
-                    let mut to_remove = Vec::new();
-                    for (a, s) in streams_map.iter_mut() {
-                        if let Err(error) = s.write_all(&vec) {
-                            println!("Error writing to stream: {:?}\nShutting down stream", error);
-                            to_remove.push(a.clone());
+        let read_vec = rec.recv();
+        match read_vec {
+            Ok(vec) => {
+                println!("{}", std::str::from_utf8(&vec).unwrap());
+                match streams.lock() {
+                    Ok(mut streams_map) => {
+                        let mut to_remove = Vec::new();
+                        for (a, s) in streams_map.iter_mut() {
+                            if let Err(error) = s.write_all(&vec) {
+                                println!("Error writing to stream: {:?}\nShutting down stream", error);
+                                to_remove.push(a.clone());
+                            }
+                        }
+                        for a in to_remove {
+                            streams_map.remove(&a);
                         }
                     }
-                    for a in to_remove {
-                        streams_map.remove(&a);
+                    Err(error) => {
+                        println!("Error trying to acquire mutex: {:?}\nAttempting to shut down gracefully", error);
+                        return;
                     }
                 }
-                Err(error) => {
-                    println!("Error trying to acquire mutex: {:?}\nAttempting to shut down gracefully", error);
-                    return;
-                }
+            }
+            Err(error) => {
+                println!("Receiver dropped {:?}\nShutting down program", error);
             }
         }
     }
 }
 
 
-fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, stream: &mut TcpStream) {
+fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, stream: &mut TcpStream, streams: Arc<Mutex<HashMap<SocketAddr, TcpStream>>>) {
     let buf = &mut Vec::new();
+    let cloned = stream.try_clone().unwrap();
+    let addr = stream.peer_addr().unwrap();
     let mut reader = BufReader::new(stream);
     while should_run.load(Ordering::Acquire) {
         match reader.read_until(0u8, buf) {
-            Ok(_) => {
+            Ok(bytes_read) => {
+                if bytes_read == 0 {
+                    continue;
+                }
                 if let Err(error) = snd.send(buf.to_owned()) {
                     println!("Error sending to channel: {:?}\nReceiver is possibly lost, terminating program", error);
                     should_run.store(false, Ordering::Release);
@@ -119,6 +131,8 @@ fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, st
                     std::io::ErrorKind::WouldBlock => {}
                     _ => {
                         println!("Error reading from the stream: {:?}\nDisconnecting client", error);
+                        streams.lock().unwrap().remove(&addr);
+                        cloned.shutdown(Shutdown::Both).unwrap();
                         return;
                     }
                 }

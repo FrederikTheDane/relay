@@ -29,6 +29,7 @@ fn main() {
 
     s_port.parse::<u16>().unwrap_or_else( |_| panic!("Port {} is not a valid port number", s_port));
 
+    //Keeping track of whether the program should keep running, to allow a graceful shutdown
     let run = Arc::new(AtomicBool::new(true));
     let r = run.clone();
     ctrlc::set_handler(move || {
@@ -42,10 +43,12 @@ fn main() {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", s_port)).expect("Failed to bind listener");
     println!("Listening on port {}", s_port);
 
+    //Channels for sending between a connection handler and the server message distributor
     let (snd, rcv) = mpsc::channel::<Vec<u8>>();
 
     let dist_run = run.clone();
 
+    //Thread for distributing messages to connected clients
     let connections_dist_clone = connections.clone();
     thread::spawn(move || {
         distribute(rcv, dist_run, connections_dist_clone);
@@ -62,6 +65,8 @@ fn main() {
             let mut cloned_stream = stream.0.try_clone().unwrap();
             connections.lock().unwrap().insert(stream.1, stream.0);
             let conn_handler_clone = connections.clone();
+
+            //Start a new thread handling incoming data for the newly connected client
             thread::spawn(move || {
                 handle_connection(send, run_clone, &mut cloned_stream, conn_handler_clone);
             });        
@@ -82,10 +87,13 @@ fn distribute(rec: mpsc::Receiver<Vec<u8>>, should_run: Arc<AtomicBool>, streams
         let read_vec = rec.recv();
         match read_vec {
             Ok(vec) => {
+                //Print the received message to stdout
                 println!("{}", std::str::from_utf8(&vec).unwrap());
                 match streams.lock() {
                     Ok(mut streams_map) => {
                         let mut to_remove = Vec::new();
+
+                        //Send the message to all clients, and make sure to disconnect the client if something goes wrong
                         for (a, s) in streams_map.iter_mut() {
                             if let Err(error) = s.write_all(&vec) {
                                 println!("Error writing to stream: {:?}\nShutting down stream", error);
@@ -116,8 +124,10 @@ fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, st
     let addr = stream.peer_addr().unwrap();
     let mut reader = BufReader::new(stream);
     while should_run.load(Ordering::Acquire) {
+        //Read until a null terminator is received
         match reader.read_until(0u8, buf) {
             Ok(bytes_read) => {
+                //Make sure we're only sending the message if something was actually received
                 if bytes_read == 0 {
                     continue;
                 }

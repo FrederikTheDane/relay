@@ -123,6 +123,7 @@ fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, st
     let cloned = stream.try_clone().unwrap();
     let addr = stream.peer_addr().unwrap();
     let mut reader = BufReader::new(stream);
+    let mut should_dc = false;
     while should_run.load(Ordering::Acquire) {
         //Read until a null terminator is received
         match reader.read_until(0u8, buf) {
@@ -139,14 +140,22 @@ fn handle_connection(snd: mpsc::Sender<Vec<u8>>, should_run: Arc<AtomicBool>, st
             Err(error) => {
                 match error.kind() {
                     std::io::ErrorKind::WouldBlock => {}
+                    std::io::ErrorKind::ConnectionAborted => {
+                        println!("{} disconnected", addr);
+                        should_dc = true;
+                    }
                     _ => {
                         println!("Error reading from the stream: {:?}\nDisconnecting client", error);
-                        streams.lock().unwrap().remove(&addr);
-                        cloned.shutdown(Shutdown::Both).unwrap();
-                        return;
+                        should_dc = true;
                     }
                 }
             }
+        }
+        buf.clear();
+        if should_dc {
+            streams.lock().unwrap().remove(&addr);
+            cloned.shutdown(Shutdown::Both).unwrap();
+            return;
         }
     }
 }
